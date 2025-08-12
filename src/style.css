@@ -1,0 +1,17 @@
+body, html {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+#canvas {
+  display: block;
+}
+
+#mainVideo {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  opacity: 0.7;
+}

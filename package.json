@@ -1,0 +1,20 @@
+{
+  "name": "threejs-vite-project",
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "vite preview"
+  },
+  "dependencies": {
+    "dat.gui": "^0.7.9",
+    "delaunator": "^5.0.1",
+    "numeric": "^1.2.6",
+    "seedrandom": "^3.0.5",
+    "three": "^0.153.0",
+    "three-stdlib": "^2.36.0"
+  },
+  "devDependencies": {
+    "vite": "^4.4.0"
+  }
+}
