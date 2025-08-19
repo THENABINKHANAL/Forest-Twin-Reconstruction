@@ -3,6 +3,8 @@ import seedrandom from 'seedrandom';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Delaunator from 'delaunator';
 import { GUI } from 'dat.gui';
+import { getMaskIdAtPoint, frameMap, decodeRLEtoMask } from './tree_info.js';
+
 
 // — Scene, camera, renderer setup —
 const canvas = document.getElementById('canvas');
@@ -52,7 +54,7 @@ window.addEventListener('resize', () => {
 // — GUI & params —
 const gui = new GUI();
 const params = {
-    maxIterations: 30000,
+    maxIterations: 20000,
     clusterThreshold: 0.3,
     minClusterSize: 120,
     showGround: true,
@@ -60,26 +62,28 @@ const params = {
     minTreeHeight: 0.6,
     mergeClusterThreshold: 1.5,
     showPoints: true,
-    renderCameraPoints: true,
+    renderCameraPoints: false,
     showImage: false,
     showAllPoints: true
-
 };
 
-// — Seeded RNG for deterministic RANSAC —
+// — Seeded RNG for deterministic behavior —
 const rng = seedrandom('fixed-seed');
+function rngInt(min, max) { return Math.floor(rng() * (max - min + 1)) + min; }
 
 // — Data placeholders —
 let posArray, pointCount, groundSet, vegPointsMesh;
 let cameraPoints = [], camIndex = 0, clusterData = [], treeMeshes = [];
 const prevCamPos = new THREE.Vector3();
+
+let treeMetrics = [];
 // — 1) Ground segmentation + mesh creation —
 function segmentGround() {
     // 1) sample random triangle normals
     const normals = [];
     for (let i = 0; i < params.maxIterations; i++) {
         const picks = new Set();
-        while (picks.size < 3) picks.add(Math.floor(Math.random() * pointCount));
+        while (picks.size < 3) picks.add(rngInt(0, pointCount - 1));
         const [i1, i2, i3] = [...picks];
         const p1 = new THREE.Vector3().fromArray(posArray, i1 * 3);
         const p2 = new THREE.Vector3().fromArray(posArray, i2 * 3);
@@ -121,8 +125,11 @@ function segmentGround() {
     }
 
     // 6) build rectangular mesh
-    const minU = Math.min(...projUs), maxU = Math.max(...projUs);
-    const minV = Math.min(...projVs), maxV = Math.max(...projVs);
+    const minU = projUs.reduce((a, b) => Math.min(a, b), Infinity);
+    const maxU = projUs.reduce((a, b) => Math.max(a, b), -Infinity);
+    const minV = projVs.reduce((a, b) => Math.min(a, b), Infinity);
+    const maxV = projVs.reduce((a, b) => Math.max(a, b), -Infinity);
+
     const corners = [
         centroid.clone().add(e1.clone().multiplyScalar(minU)).add(e2.clone().multiplyScalar(minV)),
         centroid.clone().add(e1.clone().multiplyScalar(maxU)).add(e2.clone().multiplyScalar(minV)),
@@ -180,22 +187,22 @@ function createProceduralTree(levels, length, radius, pos, dir) {
 
     if (levels > 0) {
         // 3) compute new branch parameters
-        const newLength = length * (0.7 + Math.random() * 0.1);
+        const newLength = length * (0.7 + rng() * 0.1);
         const newRadius = radius * 0.4;
 
         // 4) endpoints for this segment
         const end = pos.clone()
             .add(dir.clone().multiplyScalar(length));
 
-        // 5) spawn two child branches at random angles
+        // 5) spawn two child branches at seeded random angles
         for (let i = 0; i < 2; i++) {
             // pick an angle off the dir vector
             const axis = new THREE.Vector3(
-                Math.random() - 0.5,
-                Math.random(),
-                Math.random() - 0.5
+                rng() - 0.5,
+                rng(),
+                rng() - 0.5
             ).normalize();
-            const angle = (Math.PI / 4) + (Math.random() * Math.PI / 8);
+            const angle = (Math.PI / 4) + (rng() * Math.PI / 8);
             const childDir = dir.clone().applyAxisAngle(axis, angle).normalize();
 
             const child = createProceduralTree(
@@ -219,6 +226,9 @@ function clusterTrees() {
     centerCubes.forEach(c => scene.remove(c));
     centerCubes = [];
     if (vegPointsMesh) scene.remove(vegPointsMesh);
+
+    treeMetrics = [];
+
 
     // 1) extract ground‐mesh corners & compute plane normal + centroid
     const gp = groundMesh.geometry.attributes.position.array;
@@ -267,16 +277,16 @@ function clusterTrees() {
     let clusters = Array.from(bins.values())
         .filter(c => c.length >= params.minClusterSize);
 
-    // 6) IQR‐based height filter along normal (rand. sampling)
+    // 6) IQR‐based height filter along normal (seeded sampling)
     clusters = clusters.filter(cluster => {
         const n = cluster.length;
         if (n < 2) return false;
         const sampleCount = Math.min(10000, n * (n - 1) / 2);
         const dists = [];
         for (let k = 0; k < sampleCount; k++) {
-            let i = Math.floor(Math.random() * n);
+            let i = rngInt(0, n - 1);
             let j;
-            do { j = Math.floor(Math.random() * n); } while (j === i);
+            do { j = rngInt(0, n - 1); } while (j === i);
             const p1 = new THREE.Vector3().fromArray(posArray, cluster[i] * 3);
             const p2 = new THREE.Vector3().fromArray(posArray, cluster[j] * 3);
             dists.push(Math.abs(distanceAlongDirection(p1, p2, bestNormal)));
@@ -322,10 +332,11 @@ function clusterTrees() {
     const vegCols = [];
 
     treeMeshes.forEach(tree => scene.remove(tree));
-
-    clusterData.forEach(data => {
-        const col = new THREE.Color(Math.random(), Math.random(), Math.random());
+    vegToCluster = {}
+    clusterData.forEach((data, clusterIndex) => {
+        const col = new THREE.Color(rng(), rng(), rng());
         data.indices.forEach(idx => {
+
             vegPos.push(...posArray.slice(idx * 3, idx * 3 + 3));
             vegCols.push(col.r, col.g, col.b);
         });
@@ -340,6 +351,7 @@ function clusterTrees() {
         let minY = Infinity, maxY = -Infinity, maxDist = 0;
         const cx = data.centroid.x, cz = data.centroid.z;
         data.indices.forEach(idx => {
+
             const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
             if (y < minY) minY = y;
             if (y > maxY) maxY = y;
@@ -347,6 +359,8 @@ function clusterTrees() {
             const dx = x - cx, dz = z - cz;
             const d = Math.sqrt(dx * dx + dz * dz);
             if (d > maxDist) maxDist = d;
+            vegToCluster[x + "," + y + "," + z] = clusterIndex
+
         });
         const height = maxY - minY;
         const radius = maxDist; // base radius matches half the cluster width
@@ -354,20 +368,29 @@ function clusterTrees() {
         // 2) place tree so its base sits at the cluster bottom
         const bottomPos = new THREE.Vector3(cx, minY, cz);
         const tree = createProceduralTree(
-      /*levels=*/3,
-      /*length=*/height,
-      /*radius=*/radius,
+            /*levels=*/3,
+            /*length=*/height,
+            /*radius=*/radius,
             bottomPos,
             new THREE.Vector3(0, 1, 0)
         );
 
+        // New: store metrics (width = diameter = 2 * radius)
+        if (!Array.isArray(treeMetrics)) treeMetrics = [];
+        treeMetrics.push({
+            id: treeMetrics.length, // simple sequential id; customize if you prefer
+            base_position: { x: bottomPos.x, y: bottomPos.y, z: bottomPos.z },
+            centroid: { x: data.centroid.x, y: data.centroid.y, z: data.centroid.z },
+            height: height,
+            width: 2 * radius
+        });
+
         scene.add(tree);
         treeMeshes.push(tree);
-        if(params.showPoints){
+        if (params.showPoints) {
             centerCubes.push(cube);
         }
     });
-
 
     if (params.showPoints) {
         // 10) draw clustered points mesh
@@ -382,7 +405,7 @@ function clusterTrees() {
         scene.add(vegPointsMesh);
     }
 
-    showGroundPoint()
+    showGroundPoint();
 }
 
 function laplacianSmooth(geometry, iterations = 2, lambda = 0.5) {
@@ -432,12 +455,12 @@ function laplacianSmooth(geometry, iterations = 2, lambda = 0.5) {
     geometry.computeVertexNormals();
 }
 
-
 let groundArrow = null;
 let belowPointsMesh = null;
 let belowMesh = null;
 let fullPointsMesh = null; // all points mesh
 let cameraSpritesGroup = null;
+let vegToCluster = {};
 
 function showGroundPoint() {
     if (!groundMesh) segmentGround();
@@ -539,15 +562,13 @@ function showGroundPoint() {
     });
     belowMesh = new THREE.Mesh(meshGeom, meshMat);
     scene.add(belowMesh);
-    
 }
 
-function toggleCameraPoints(){
-
+function toggleCameraPoints() {
     if (cameraSpritesGroup) {
         cameraSpritesGroup.forEach(element => {
-            scene.remove(element)
-        });;
+            scene.remove(element);
+        });
     }
     else {
         cameraSpritesGroup = [];
@@ -594,36 +615,337 @@ function seekVideoFrame(frameIdx) {
     });
 }
 
+// Helper: get video/canvas dimensions (fallbacks are safe)
+function getVideoDims() {
+    const W = (video && video.videoWidth) || renderer.domElement.clientWidth || 640;
+    const H = (video && video.videoHeight) || renderer.domElement.clientHeight || 384;
+    return { W, H };
+}
+
+
+function getAllTreePointsAtDistanceFromCamera(distance) {
+    if (!vegPointsMesh || !vegPointsMesh.geometry?.attributes?.position) return [];
+
+    // Ensure camera matrices are fresh
+    camera.updateMatrixWorld(true);
+    camera.updateProjectionMatrix();
+
+    const { W, H } = getVideoDims();
+
+    // Camera world position & forward direction (unit)
+    const camPos = new THREE.Vector3();
+    const viewDir = new THREE.Vector3();
+    camera.getWorldPosition(camPos);
+    camera.getWorldDirection(viewDir); // normalized
+
+    // Iterate vegetation vertices
+    const posAttr = vegPointsMesh.geometry.attributes.position;
+    const V = posAttr.count;
+
+    const out = [];
+    const pWorld = new THREE.Vector3();
+    const pNDC = new THREE.Vector3();
+
+    for (let i = 0; i < V; i++) {
+        // world position of vertex
+        pWorld.fromBufferAttribute(posAttr, i);
+
+        // signed distance ALONG the camera's forward direction:
+        // (point - camPos) ⋅ viewDir
+        const along = pWorld.clone().sub(camPos).dot(viewDir);
+        if (along <= 0 || along > distance) continue; // behind camera or beyond range
+
+        // Project to NDC
+        pNDC.copy(pWorld).project(camera);
+
+        // Clip-space visibility check
+        if (pNDC.z < -1 || pNDC.z > 1) continue;
+
+        // Convert NDC -> pixel coords
+        const x = (pNDC.x + 1) * 0.5 * W;
+        const y = (1 - (pNDC.y + 1) * 0.5) * H;
+
+        // Discard if off-screen
+        if (x < 0 || y < 0 || x > W || y > H) continue;
+
+        out.push({ x, y, index: i, treeIndex: vegToCluster[pWorld.x + "," + pWorld.xy + "," + pWorld.xz] });
+    }
+
+    return out;
+}
+
+const images = {}
+
+async function downloadImagesAsZip(images) {
+    debugger
+
+    const zip = new JSZip();
+
+    for (const id of Object.keys(images)) {
+        const imgArray = images[id];
+        for (let idx = 0; idx < imgArray.length; idx++) {
+            const img = imgArray[idx].img;
+            if (!img.src) continue;
+
+            // Fetch image data as blob
+            const response = await fetch(img.src);
+            const blob = await response.blob();
+
+            // Add to ZIP with desired filename
+            const filename = `image_${id}_${imgArray[idx].treeIndex}_${idx}.png`;
+            zip.file(filename, blob);
+        }
+    }
+
+    // Generate ZIP and trigger download
+    const zipBlob = await zip.generateAsync({ type: "blob" });
+    saveAs(zipBlob, "segmented_images.zip");
+}
+
+function denormBox(bn, W, H) {
+    const [x, y, w, h] = bn;
+    return [x * W, y * H, w * W, h * H];
+}
+
+function downloadJSON(obj, filename = "trees.json") {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+    saveAs(blob, filename); // you already use FileSaver's saveAs()
+}
+
+
+const decodedMaskCache = new Map();
+
+function makeMaskedCropForId(id, camIndex, { background = "transparent" } = {}) {
+    const fr = frameMap.get(camIndex);
+    if (!fr || !Array.isArray(fr.detections)) return null;
+
+    const W = video.videoWidth || tracking.meta?.width || 640;
+    const H = video.videoHeight || tracking.meta?.height || 384;
+
+    // Find detection by id
+    const di = fr.detections.findIndex(d => (d.id ?? d.raw_id) == id);
+    if (di < 0) return null;
+    const det = fr.detections[di];
+    if (!det?.mask_rle) return null;
+
+    // Decode mask (cached)
+    const key = camIndex + "#" + di;
+    let dec = decodedMaskCache.get(key);
+    if (!dec) {
+        dec = decodeRLEtoMask(det.mask_rle); // { data (Uint8Array), h, w }
+        decodedMaskCache.set(key, dec);
+    }
+    const { data, h: mh, w: mw } = dec;
+
+    // Get bbox in pixel coords (prefer provided bbox; fallback to mask bounds)
+    let bx, by, bw, bh;
+    if (det.bbox_norm) {
+        [bx, by, bw, bh] = denormBox(det.bbox_norm, W, H);
+    } else {
+        // Fallback: compute bbox from mask (in mask space, then map to image space)
+        let minX = mw, minY = mh, maxX = -1, maxY = -1;
+        for (let x = 0; x < mw; x++) {
+            const colBase = x * mh;
+            for (let y = 0; y < mh; y++) {
+                if (data[colBase + y]) {
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x > maxX) maxX = x;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX < 0) return null; // no pixels
+        bx = (minX / mw) * W;
+        by = (minY / mh) * H;
+        bw = ((maxX - minX + 1) / mw) * W;
+        bh = ((maxY - minY + 1) / mh) * H;
+    }
+
+    // Clamp & round bbox to integer crop canvas
+    const ix = Math.max(0, Math.floor(bx));
+    const iy = Math.max(0, Math.floor(by));
+    const iw = Math.max(1, Math.min(W - ix, Math.round(bw)));
+    const ih = Math.max(1, Math.min(H - iy, Math.round(bh)));
+
+    // 1) Draw the video crop
+    const crop = document.createElement("canvas");
+    crop.width = iw;
+    crop.height = ih;
+    const cctx = crop.getContext("2d");
+    cctx.drawImage(video, ix, iy, iw, ih, 0, 0, iw, ih);
+
+    // 2) Build a crop-sized alpha mask from the detection mask
+    const maskCan = document.createElement("canvas");
+    maskCan.width = iw;
+    maskCan.height = ih;
+    const mctx = maskCan.getContext("2d");
+    const maskImg = mctx.createImageData(iw, ih);
+    const mdata = maskImg.data;
+
+    // Map from mask coords (mw x mh, column-major) to crop coords (iw x ih)
+    const scaleX = W / mw;
+    const scaleY = H / mh;
+
+    // Only loop within mask-space region that overlaps the bbox → faster
+    const sx = Math.max(0, Math.floor(ix / scaleX));
+    const ex = Math.min(mw - 1, Math.ceil((ix + iw) / scaleX) - 1);
+    const sy = Math.max(0, Math.floor(iy / scaleY));
+    const ey = Math.min(mh - 1, Math.ceil((iy + ih) / scaleY) - 1);
+
+    // Coverage for upscales to avoid holes
+    const covX = Math.max(1, Math.ceil(scaleX));
+    const covY = Math.max(1, Math.ceil(scaleY));
+
+    for (let mx = sx; mx <= ex; mx++) {
+        const colBase = mx * mh;
+        const ixFloat = mx * scaleX;
+        for (let my = sy; my <= ey; my++) {
+            if (!data[colBase + my]) continue;
+            const iyFloat = my * scaleY;
+
+            // Convert to crop coords
+            const cx0 = Math.floor(ixFloat - ix);
+            const cy0 = Math.floor(iyFloat - iy);
+
+            // Fill a small block to cover scaling gaps
+            for (let dx = 0; dx < covX; dx++) {
+                const cx = cx0 + dx;
+                if (cx < 0 || cx >= iw) continue;
+                for (let dy = 0; dy < covY; dy++) {
+                    const cy = cy0 + dy;
+                    if (cy < 0 || cy >= ih) continue;
+                    const aIdx = (cy * iw + cx) * 4 + 3; // alpha channel
+                    mdata[aIdx] = 255;
+                }
+            }
+        }
+    }
+    mctx.putImageData(maskImg, 0, 0);
+
+    // 3) Apply mask to crop (everything else becomes transparent)
+    cctx.globalCompositeOperation = "destination-in";
+    cctx.drawImage(maskCan, 0, 0);
+    cctx.globalCompositeOperation = "source-over";
+
+    // 4) Optional black background
+    let outCan = crop;
+    if (background === "black") {
+        outCan = document.createElement("canvas");
+        outCan.width = iw;
+        outCan.height = ih;
+        const octx = outCan.getContext("2d");
+        octx.fillStyle = "black";
+        octx.fillRect(0, 0, iw, ih);
+        octx.drawImage(crop, 0, 0);
+    }
+
+    // 5) To <img>
+    const img = new Image();
+    img.src = outCan.toDataURL("image/png");
+    return img;
+}
+
 // — Camera navigation helper —
 function moveCamera(delta) {
-  if (cameraPoints.length === 0) return;
+    console.log(cameraPoints)
+    if (cameraPoints.length === 0) return;
 
-  // advance index
-  prevCamPos.copy(camera.position);
-  camIndex = (camIndex + delta + cameraPoints.length) % cameraPoints.length;
-  const np = cameraPoints[camIndex];
-  camera.position.copy(np);
+    // advance index
+    prevCamPos.copy(camera.position);
+    camIndex+=delta
+    const np = cameraPoints[camIndex];
+    camera.position.copy(np);
 
-  // sum directions over the next N points
-  const lookAhead = 200;
-  const sumDir = new THREE.Vector3(0, 0, 0);
-  for (let i = 1; i <= lookAhead || i>=cameraPoints.length; i++) {
-    const idx = (camIndex + i) % cameraPoints.length;
-    sumDir.add( cameraPoints[idx].clone().sub(np) );
-  }
+    // sum directions over the next N points
+    const lookAhead = 200;
+    const sumDir = new THREE.Vector3(0, 0, 0);
+    for (let i = 1; i <= lookAhead &&  (camIndex + i) < cameraPoints.length; i++) {
+        const idx = (camIndex + i);
+        sumDir.add(cameraPoints[idx].clone().sub(np));
+    }
 
-  // (optional) normalize if you want only direction, not magnitude:
-  sumDir.normalize();
+    // (optional) normalize if you want only direction, not magnitude:
+    sumDir.normalize();
 
-  // build the target by offsetting current pos by that summed vector
-  const tgt = np.clone().add(sumDir);
+    // build the target by offsetting current pos by that summed vector
+    const tgt = np.clone().add(sumDir);
 
-  // update controls & camera
-  controls.target.copy(tgt);
-  camera.lookAt(tgt);
-  controls.update();
+    // update controls & camera
+    controls.target.copy(tgt);
+    camera.lookAt(tgt);
+    controls.update();
 
-  seekVideoFrame(camIndex);
+    seekVideoFrame(camIndex);
+
+    let points = getAllTreePointsAtDistanceFromCamera(10.0);
+    // === REMOVE OLD OVERLAY IF IT EXISTS ===
+    //if (window.debugPointsMesh) {
+    //  scene.remove(window.debugPointsMesh);
+    //  window.debugPointsMesh.geometry.dispose();
+    //  window.debugPointsMesh.material.dispose();
+    //  window.debugPointsMesh = null;
+    //}
+    //
+    //// === BUILD OVERLAY GEOMETRY ===
+    //const posAttr = vegPointsMesh.geometry.attributes.position;
+    //const debugVerts = [];
+    //
+    //for (const pt of points) {
+    //  const idx = pt.index * 3; // 3 floats per vertex
+    //  const x = posAttr.array[idx];
+    //  const y = posAttr.array[idx + 1];
+    //  const z = posAttr.array[idx + 2];
+    //  debugVerts.push(x, y, z);
+    //}
+    //
+    //const debugGeom = new THREE.BufferGeometry();
+    //debugGeom.setAttribute('position', new THREE.Float32BufferAttribute(debugVerts, 3));
+    //
+    //// === MATERIAL ===
+    //const debugMat = new THREE.PointsMaterial({
+    //  size: 0.2,        // adjust for your scene scale
+    //  color: 0xff0000,  // red
+    //  sizeAttenuation: true
+    //});
+    //
+    //// === MESH & ADD TO SCENE ===
+    //window.debugPointsMesh = new THREE.Points(debugGeom, debugMat);
+    //scene.add(window.debugPointsMesh);
+    let ids = {}
+    for (const pt of points) {
+        let id = getMaskIdAtPoint(camIndex, pt.x / window.innerWidth, pt.y / window.innerHeight);
+
+        if (id) {
+            if (ids[id]) {
+                ids[id].push(pt.index);
+            }
+            else {
+                ids[id] = [pt.index];
+            }
+        }
+    }
+    Object.keys(ids).forEach(id => {
+        if (ids[id].length >= 200) {
+
+            let treeIndexes = {}
+            ids[id].forEach(idx => {
+                let treeIndex = vegToCluster[posArray[idx * 3] + "," + posArray[idx * 3 + 1] + "," + posArray[idx * 3 + 2]];
+                if (treeIndex !== undefined) {
+                    if (!treeIndexes[treeIndex]) treeIndexes[treeIndex] = [];
+                    treeIndexes[treeIndex].push(idx);
+                }
+            });
+            const img = makeMaskedCropForId(id, camIndex, { background: "transparent" }); // or "black"
+            if (!img) return;
+            if (!images[id]) images[id] = [];
+            images[id].push({img:img, treeIndex: Object.entries(treeIndexes)
+                .reduce((a, b) => (b[1].length > a[1].length ? b : a))[0]});
+        }
+    });
+
+
+
 }
 
 // — Manual ASCII‐PLY loader with color support —
@@ -694,37 +1016,32 @@ async function loadPLYWithColor(url) {
     for (let i = 0; i < N; i++) {
         const x = posArr[3 * i], y = posArr[3 * i + 1], z = posArr[3 * i + 2];
         const r = colArr[3 * i], g = colArr[3 * i + 1], b = colArr[3 * i + 2];
-        const isRed = (r > 0.9 && g < 0.1 && b < 0.1);
-        if (isRed) cameraPoints.push(new THREE.Vector3(x, y, z));
+        const isRed = (r === 1 && g === 0 && b === 0);
+        if (isRed){
+            cameraPoints.push(new THREE.Vector3(x, y, z));
+        }
         else posArray.push(x, y, z);
     }
     pointCount = posArray.length / 3;
-    cameraPoints.reverse()
+
+    cameraPoints.reverse();
     if (cameraPoints.length) camIndex = -1;
 
     // optional: visualize camera points
     if (cameraPoints.length) {
-        // 1) existing point cloud
         const arr = cameraPoints.flatMap(v => [v.x, v.y, v.z]);
         const pointsGeom = new THREE.BufferGeometry().setAttribute(
             'position',
             new THREE.Float32BufferAttribute(arr, 3)
         );
-        //scene.add(new THREE.Points(
-        //  pointsGeom,
-        //  new THREE.PointsMaterial({ size:0.1, color:0xff0000 })
-        //));
-
-
+        //scene.add(new THREE.Points(pointsGeom, new THREE.PointsMaterial({ size:0.1, color:0xff0000 })));
     }
 
     // run segmentation + clustering
     segmentGround();
     clusterTrees();
 
-
     if (cameraPoints.length) {
-
         // 2) Read back the plane normal & pick an in-plane axis e1
         const gp = groundMesh.geometry.attributes.position.array;
         const A = new THREE.Vector3().fromArray(gp, 0);
@@ -762,10 +1079,8 @@ async function loadPLYWithColor(url) {
             return uA - uB;
         });
 
-        toggleCameraPoints()
-
+        toggleCameraPoints();
     }
-
 
     // once metadata + at least one frame is available…
     video.addEventListener("loadeddata", async () => {
@@ -785,7 +1100,6 @@ async function loadPLYWithColor(url) {
         }
         console.log("Detected video FPS:", videoFPS);
     });
-
 
     // GUI controls
     gui.add(params, 'maxIterations', 10, 10000, 10).name('Ground plane iters')
@@ -824,8 +1138,28 @@ async function loadPLYWithColor(url) {
         if (e.key === 'ArrowLeft') moveCamera(-1);
         if (e.key === 'ArrowRight') moveCamera(+1);
     });
+
+    //runCameraAndDownload();
 })();
 
+async function runCameraAndDownload() {
+    for (const p of cameraPoints) {
+        moveCamera(+1);
+        await new Promise(resolve => setTimeout(resolve, 200)); // wait 1 sec
+    }
+
+    if (images && Object.keys(images).length > 0) {
+        await downloadImagesAsZip(images);
+    }
+
+    // Export tree metrics gathered from clusterTrees()
+    if (Array.isArray(treeMetrics) && treeMetrics.length > 0) {
+        downloadJSON({ trees: treeMetrics });
+    } else {
+        console.warn("No tree metrics to export; clusterTrees() may not have run or found any clusters.");
+    }
+
+}
 const clock = new THREE.Clock();
 scene.add(new THREE.AmbientLight(0xffffff, 0.5));
 (function animate() {
