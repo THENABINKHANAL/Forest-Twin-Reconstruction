@@ -860,7 +860,7 @@ async function loadPLYWithColor(url) {
 (async () => {
     let geometry;
     try {
-        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/Red_pine_1_output.ply');
+        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/points_with_cameras_scaled.ply');
 
         fullPointsMesh = new THREE.Points(
             geometry,
