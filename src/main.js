@@ -62,7 +62,10 @@ const params = {
     showPoints: true,
     renderCameraPoints: true,
     showImage: false,
-    showAllPoints: true
+    showAllPoints: true,
+    radiusSigmaK: 3.0,
+    elevationBand: 0.3048, // ± band around mean camera elevation (meters ~ 1 ft)
+    showElevationBandPoints: false
 
 };
 
@@ -121,8 +124,19 @@ function segmentGround() {
     }
 
     // 6) build rectangular mesh
-    const minU = Math.min(...projUs), maxU = Math.max(...projUs);
-    const minV = Math.min(...projVs), maxV = Math.max(...projVs);
+    let minU = Infinity, maxU = -Infinity;
+    let minV = Infinity, maxV = -Infinity;
+    
+    for (let i = 0; i < projUs.length; i++) {
+        const u = projUs[i];
+        const v = projVs[i];
+    
+        if (u < minU) minU = u;
+        if (u > maxU) maxU = u;
+    
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+    }    
     const corners = [
         centroid.clone().add(e1.clone().multiplyScalar(minU)).add(e2.clone().multiplyScalar(minV)),
         centroid.clone().add(e1.clone().multiplyScalar(maxU)).add(e2.clone().multiplyScalar(minV)),
@@ -151,6 +165,86 @@ let centerCubes = [];
 function distanceAlongDirection(p1, p2, direction) {
     const u = direction.clone().normalize();
     return p2.clone().sub(p1).dot(u);
+}
+
+// — Outlier-resistant sizing via iterative sigma clipping —
+function computeRobustRadius(radialDistances) {
+    if (!radialDistances || radialDistances.length === 0) return 0;
+    // Start with all values, iteratively remove values beyond mean + k*std
+    // A few iterations converge to a stable core without harsh percentile cuts.
+    let values = radialDistances.slice();
+    const maxIterations = 5;
+    for (let iter = 0; iter < maxIterations; iter++) {
+        const n = values.length;
+        if (n === 0) break;
+        const mean = values.reduce((s, v) => s + v, 0) / n;
+        const variance = values.reduce((s, v) => s + (v - mean) * (v - mean), 0) / n;
+        const std = Math.sqrt(Math.max(variance, 0));
+        const cutoff = mean + params.radiusSigmaK * std;
+        const filtered = values.filter(v => v <= cutoff);
+        if (filtered.length === values.length) {
+            // converged
+            values = filtered;
+            break;
+        }
+        // if we over-trimmed to empty, keep previous
+        if (filtered.length === 0) break;
+        values = filtered;
+    }
+    if (values.length === 0) return 0;
+    // Use a high-end representative without taking the single max (take average of top few)
+    values.sort((a, b) => a - b);
+    const take = Math.max(1, Math.floor(values.length * 0.05));
+    const tail = values.slice(-take);
+    const radius = tail.reduce((s, v) => s + v, 0) / tail.length;
+    return radius;
+}
+
+// — Algebraic circle fit (Taubin-like) on 2D points —
+// Returns { cx, cy, r } or null on failure.
+function fitCircle2D(points2) {
+    // points2: array of [u, v]
+    const n = points2.length;
+    if (n < 3) return null;
+    // compute means
+    let meanU = 0, meanV = 0;
+    for (let i = 0; i < n; i++) { meanU += points2[i][0]; meanV += points2[i][1]; }
+    meanU /= n; meanV /= n;
+    // shift to mean
+    let Suu = 0, Suv = 0, Svv = 0, Suuu = 0, Svvv = 0, Suvv = 0, Svuu = 0;
+    for (let i = 0; i < n; i++) {
+        const ui = points2[i][0] - meanU;
+        const vi = points2[i][1] - meanV;
+        const ui2 = ui * ui, vi2 = vi * vi;
+        Suu += ui2;
+        Svv += vi2;
+        Suv += ui * vi;
+        Suuu += ui2 * ui;
+        Svvv += vi2 * vi;
+        Suvv += ui * vi2;
+        Svuu += vi * ui2;
+    }
+    const A = [[Suu, Suv], [Suv, Svv]];
+    const B = [0.5 * (Suuu + Suvv), 0.5 * (Svvv + Svuu)];
+    const det = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+    if (Math.abs(det) < 1e-12) return null;
+    const invA = [
+        [ A[1][1] / det, -A[0][1] / det ],
+        [ -A[1][0] / det, A[0][0] / det ]
+    ];
+    const uc = invA[0][0] * B[0] + invA[0][1] * B[1];
+    const vc = invA[1][0] * B[0] + invA[1][1] * B[1];
+    const cx = uc + meanU;
+    const cy = vc + meanV;
+    // radius
+    let r = 0;
+    for (let i = 0; i < n; i++) {
+        const du = points2[i][0] - cx;
+        const dv = points2[i][1] - cy;
+        r += Math.sqrt(du * du + dv * dv);
+    }
+    r /= n;
+    return { cx, cy, r };
 }
 
 function createProceduralTree(levels, length, radius, pos, dir) {
@@ -317,6 +411,9 @@ function clusterTrees() {
         }
     }
 
+    // reset exported stats
+    treeStats = [];
+
     // 9) visualize merged clusters
     const vegPos = [];
     const vegCols = [];
@@ -336,32 +433,102 @@ function clusterTrees() {
         cube.position.copy(data.centroid);
         scene.add(cube);
 
-        // compute this cluster’s min/max Y to get its vertical span
-        let minY = Infinity, maxY = -Infinity, maxDist = 0;
+        // compute height and circle-based footprint using a slice near average camera elevation
+        let minY = Infinity, maxY = -Infinity;
+        const gp2 = groundMesh.geometry.attributes.position.array;
+        const A2 = new THREE.Vector3().fromArray(gp2, 0);
+        const B2 = new THREE.Vector3().fromArray(gp2, 3);
+        const C2 = new THREE.Vector3().fromArray(gp2, 6);
+        const groundNormal = new THREE.Vector3().crossVectors(B2.clone().sub(A2), C2.clone().sub(A2)).normalize();
+        const I3 = new THREE.Matrix3().identity();
+        const nnT2 = new THREE.Matrix3().set(
+            groundNormal.x * groundNormal.x, groundNormal.x * groundNormal.y, groundNormal.x * groundNormal.z,
+            groundNormal.y * groundNormal.x, groundNormal.y * groundNormal.y, groundNormal.y * groundNormal.z,
+            groundNormal.z * groundNormal.x, groundNormal.z * groundNormal.y, groundNormal.z * groundNormal.z
+        );
+        const Pplane = new THREE.Matrix3();
+        Pplane.elements = I3.elements.map((v, i) => v - nnT2.elements[i]);
+        const e1p = (Math.abs(groundNormal.x) < 0.9
+            ? groundNormal.clone().cross(new THREE.Vector3(1, 0, 0))
+            : groundNormal.clone().cross(new THREE.Vector3(0, 1, 0))
+        ).normalize();
+        const e2p = groundNormal.clone().cross(e1p).normalize();
+
+        // average camera elevation along groundNormal
+        let meanCamH = 0;
+        if (cameraPoints.length > 0) {
+            const camCentroid = cameraPoints.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(cameraPoints.length);
+            // elevation proxy: dot with normal relative to ground centroid (A2)
+            meanCamH = camCentroid.clone().sub(A2).dot(groundNormal);
+        }
+
+        const band = params.elevationBand;
+        const projectedSlice = [];
+        const elevationBandPositions = [];
         const cx = data.centroid.x, cz = data.centroid.z;
         data.indices.forEach(idx => {
             const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
             if (y < minY) minY = y;
             if (y > maxY) maxY = y;
-            // horizontal distance from centroid
-            const dx = x - cx, dz = z - cz;
-            const d = Math.sqrt(dx * dx + dz * dz);
-            if (d > maxDist) maxDist = d;
+            // elevation along ground normal
+            const elev = new THREE.Vector3(x, y, z).sub(A2).dot(groundNormal);
+            if (Math.abs(elev - meanCamH) <= band) {
+                // project into plane UV
+                const v = new THREE.Vector3(x, y, z).sub(A2).applyMatrix3(Pplane);
+                const uCoord = v.dot(e1p), vCoord = v.dot(e2p);
+                projectedSlice.push([uCoord, vCoord]);
+                elevationBandPositions.push(x, y, z);
+            }
         });
         const height = maxY - minY;
-        const radius = maxDist; // base radius matches half the cluster width
+
+        let fittedCenter = null;
+        let fittedRadius = 0;
+        const circle = fitCircle2D(projectedSlice);
+        if (circle) {
+            fittedCenter = { u: circle.cx, v: circle.cy };
+            fittedRadius = circle.r;
+        } else {
+            // fallback to sigma-clipped radius around centroid
+            const radialDistances = [];
+            data.indices.forEach(idx => {
+                const x = posArray[idx * 3], z = posArray[idx * 3 + 2];
+                const dx = x - cx, dz = z - cz;
+                radialDistances.push(Math.sqrt(dx * dx + dz * dz));
+            });
+            fittedRadius = computeRobustRadius(radialDistances);
+        }
 
         // 2) place tree so its base sits at the cluster bottom
-        const bottomPos = new THREE.Vector3(cx, minY, cz);
+        let bottomPos;
+        if (fittedCenter) {
+            // map fitted (u,v) back to world using plane frame at A2
+            const centerWorld = A2.clone()
+                .add(e1p.clone().multiplyScalar(fittedCenter.u))
+                .add(e2p.clone().multiplyScalar(fittedCenter.v));
+            bottomPos = new THREE.Vector3(centerWorld.x, minY, centerWorld.z);
+        } else {
+            bottomPos = new THREE.Vector3(cx, minY, cz);
+        }
         const tree = createProceduralTree(
       /*levels=*/3,
       /*length=*/height,
-      /*radius=*/radius,
+      /*radius=*/fittedRadius,
             bottomPos,
             new THREE.Vector3(0, 1, 0)
         );
 
         scene.add(tree);
+        // record stats for export
+        treeStats.push({
+            centerX: bottomPos.x,
+            centerY: bottomPos.y,
+            centerZ: bottomPos.z,
+            radius: fittedRadius,
+            diameter: 2 * fittedRadius,
+            height: height,
+            points: data.indices.length,
+        });
         treeMeshes.push(tree);
         if(params.showPoints){
             centerCubes.push(cube);
@@ -380,6 +547,25 @@ function clusterTrees() {
         );
         vegPointsMesh.visible = params.showVegetation;
         scene.add(vegPointsMesh);
+    }
+
+    // visualize elevation-band points if requested
+    if (elevationBandPointsMesh) { scene.remove(elevationBandPointsMesh); elevationBandPointsMesh = null; }
+    if (params.showElevationBandPoints && elevationBandPositions.length >= 3) {
+        const geomEB = new THREE.BufferGeometry();
+        geomEB.setAttribute('position', new THREE.Float32BufferAttribute(elevationBandPositions, 3));
+        elevationBandPointsMesh = new THREE.Points(
+            geomEB,
+            new THREE.PointsMaterial({
+                size: 0.12,
+                color: 0x0000ff,
+                sizeAttenuation: false,
+                depthTest: false,
+                transparent: true,
+                opacity: 1.0
+            })
+        );
+        scene.add(elevationBandPointsMesh);
     }
 
     showGroundPoint()
@@ -438,6 +624,8 @@ let belowPointsMesh = null;
 let belowMesh = null;
 let fullPointsMesh = null; // all points mesh
 let cameraSpritesGroup = null;
+let elevationBandPointsMesh = null;
+let treeStats = [];
 
 function showGroundPoint() {
     if (!groundMesh) segmentGround();
@@ -446,6 +634,7 @@ function showGroundPoint() {
     if (groundArrow) scene.remove(groundArrow);
     if (belowPointsMesh) scene.remove(belowPointsMesh);
     if (belowMesh) scene.remove(belowMesh);
+    if (elevationBandPointsMesh) { scene.remove(elevationBandPointsMesh); elevationBandPointsMesh = null; }
 
     // 2) compute plane normal & centroid
     const posG = groundMesh.geometry.attributes.position.array;
@@ -671,7 +860,7 @@ async function loadPLYWithColor(url) {
 (async () => {
     let geometry;
     try {
-        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/points_with_cameras_scaled.ply');
+        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/Red_pine_1_output.ply');
 
         fullPointsMesh = new THREE.Points(
             geometry,
@@ -798,6 +987,12 @@ async function loadPLYWithColor(url) {
         .onChange(clusterTrees);
     gui.add(params, 'mergeClusterThreshold', 0.1, 5, 0.1).name('Merge Cluster Thres')
         .onChange(clusterTrees);
+    gui.add(params, 'radiusSigmaK', 0.5, 5.0, 0.1).name('Radius Sigma K')
+        .onChange(clusterTrees);
+    gui.add(params, 'elevationBand', 0.05, 2.0, 0.01).name('Elev Band (m)')
+        .onChange(clusterTrees);
+    gui.add(params, 'showElevationBandPoints').name('Show Elev Band Pts')
+        .onChange(clusterTrees);
     gui.add(params, 'showGround').name('Show Ground')
         .onChange(v => groundMesh.visible = v);
     gui.add(params, 'showVegetation').name('Show Trees')
@@ -818,6 +1013,7 @@ async function loadPLYWithColor(url) {
     gui.add(params, 'showAllPoints')
         .name('Show All Points')
         .onChange(v => fullPointsMesh.visible = v);
+    gui.add({ export: () => exportTreeStatsCSV() }, 'export').name('Export Trees CSV');
     gui.add({ prev: () => moveCamera(-1) }, 'prev').name('◀ Camera');
     gui.add({ next: () => moveCamera(+1) }, 'next').name('Camera ▶');
     window.addEventListener('keydown', e => {
@@ -841,3 +1037,25 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.5));
 
     renderer.render(scene, camera);
 })();
+
+// — CSV export of tree stats —
+function exportTreeStatsCSV() {
+    if (!treeStats || treeStats.length === 0) {
+        console.warn('No tree stats to export. Run clustering first.');
+        return;
+    }
+    const header = ['centerX','centerY','centerZ','radius','diameter','height','points'];
+    const rows = treeStats.map(t => [
+        t.centerX, t.centerY, t.centerZ, t.radius, t.diameter, t.height, t.points
+    ]);
+    const csv = [header.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'trees.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
