@@ -4,6 +4,8 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Delaunator from 'delaunator';
 import { GUI } from 'dat.gui';
 import { getMaskIdAtPoint, frameMap, decodeRLEtoMask } from './tree_info.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+const gltfLoader = new GLTFLoader();
 
 
 // — Scene, camera, renderer setup —
@@ -219,6 +221,63 @@ function createProceduralTree(levels, length, radius, pos, dir) {
     return tree;
 }
 
+function forceBrownTransparentUnlit(object3D, {
+  color = 0x8B5A2B,  // or a THREE.Color
+  opacity = 0.35,
+  doubleSided = true
+} = {}) {
+  const color3 = (color.isColor ? color : new THREE.Color(color));
+
+  object3D.traverse((child) => {
+    if (!child.isMesh) return;
+
+    // 1) Strip materials & textures
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    mats.forEach((m) => {
+      if (!m) return;
+      [
+        'map','aoMap','metalnessMap','roughnessMap','normalMap','emissiveMap','specularMap',
+        'alphaMap','envMap','clearcoatNormalMap','sheenColorMap','transmissionMap','thicknessMap'
+      ].forEach((k) => { if (m[k]) { m[k].dispose?.(); m[k] = null; } });
+      m.dispose?.();
+    });
+
+    // 2) Remove vertex colors (can force everything dark)
+    const g = child.geometry;
+    if (g && g.attributes && g.attributes.color) {
+      g.deleteAttribute('color');
+      g.attributes.color = undefined;
+    }
+
+    // 3) Ensure normals exist for good measure
+    if (g && (!g.attributes.normal || g.attributes.normal.count === 0)) {
+      g.computeVertexNormals();
+    }
+
+    // 4) Replace with UNLIT material (lighting-independent)
+    const newMat = new THREE.MeshBasicMaterial({
+      color: color3,
+      transparent: true,
+      opacity,
+      side: doubleSided ? THREE.DoubleSide : THREE.FrontSide,
+      depthWrite: false
+    });
+
+    // Just in case any flags were odd on the old material
+    newMat.colorWrite = true;
+    newMat.toneMapped = false;  // keep exact color under any tone mapping
+
+    child.material = newMat;
+    child.castShadow = false;   // not necessary for unlit; avoids odd artifacts
+    child.receiveShadow = false;
+  });
+
+  object3D.renderOrder = 1;
+}
+
+
+
+
 function clusterTrees() {
     if (!groundMesh) segmentGround();
 
@@ -331,66 +390,139 @@ function clusterTrees() {
     const vegPos = [];
     const vegCols = [];
 
-    treeMeshes.forEach(tree => scene.remove(tree));
-    vegToCluster = {}
-    clusterData.forEach((data, clusterIndex) => {
-        const col = new THREE.Color(rng(), rng(), rng());
-        data.indices.forEach(idx => {
+    // Clear old trees
+    treeMeshes.forEach(t => scene.remove(t));
+    treeMeshes.length = 0;
+    if (params.showPoints) {
+    centerCubes.forEach(c => scene.remove(c));
+    centerCubes.length = 0;
+    }
+    vegToCluster = {};
 
-            vegPos.push(...posArray.slice(idx * 3, idx * 3 + 3));
-            vegCols.push(col.r, col.g, col.b);
-        });
-        const cube = new THREE.Mesh(
-            new THREE.BoxGeometry(0.2, 0.2, 0.2),
-            new THREE.MeshStandardMaterial({ color: col })
-        );
-        cube.position.copy(data.centroid);
-        scene.add(cube);
+    const tryAddGLBOrProcedural = (data, clusterIndex, col) => {
+    // 1) accumulate points + color + mapping
+    data.indices.forEach(idx => {
+        vegPos.push(...posArray.slice(idx * 3, idx * 3 + 3));
+        vegCols.push(col.r, col.g, col.b);
+        const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
+        vegToCluster[`${x},${y},${z}`] = clusterIndex;
+    });
 
-        // compute this cluster’s min/max Y to get its vertical span
-        let minY = Infinity, maxY = -Infinity, maxDist = 0;
-        const cx = data.centroid.x, cz = data.centroid.z;
-        data.indices.forEach(idx => {
+    // 2) centroid cube
+    const cube = new THREE.Mesh(
+        new THREE.BoxGeometry(0.2, 0.2, 0.2),
+        new THREE.MeshStandardMaterial({ color: col })
+    );
+    cube.position.copy(data.centroid);
+    scene.add(cube);
+    if (params.showPoints) centerCubes.push(cube);
 
-            const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            // horizontal distance from centroid
-            const dx = x - cx, dz = z - cz;
-            const d = Math.sqrt(dx * dx + dz * dz);
-            if (d > maxDist) maxDist = d;
-            vegToCluster[x + "," + y + "," + z] = clusterIndex
+    // 3) compute vertical span, base radius, base position
+    let minY = Infinity, maxY = -Infinity, maxDist = 0;
+    const cx = data.centroid.x, cz = data.centroid.z;
+    data.indices.forEach(idx => {
+        const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const dx = x - cx, dz = z - cz;
+        const d = Math.hypot(dx, dz);
+        if (d > maxDist) maxDist = d;
+    });
+    const height = Math.max(0.01, maxY - minY);
+    const radius = Math.max(0.01, maxDist);
+    const bottomPos = new THREE.Vector3(cx, minY, cz);
 
-        });
-        const height = maxY - minY;
-        const radius = maxDist; // base radius matches half the cluster width
+    // 4) metrics
+    if (!Array.isArray(treeMetrics)) treeMetrics = [];
+    const metricId = treeMetrics.length;
+    const metrics = {
+        id: metricId,
+        base_position: { x: bottomPos.x, y: bottomPos.y, z: bottomPos.z },
+        centroid: { x: data.centroid.x, y: data.centroid.y, z: data.centroid.z },
+        height: height,
+        width: 2 * radius
+    };
+    treeMetrics.push(metrics);
 
-        // 2) place tree so its base sits at the cluster bottom
-        const bottomPos = new THREE.Vector3(cx, minY, cz);
+    // 5) attempt to load GLB; fallback to procedural on error
+    const url = `./GS_Forest/Red_Pine_1/segmented_images/${clusterIndex}.glb`;
+
+    const useProcedural = () => {
         const tree = createProceduralTree(
-            /*levels=*/3,
-            /*length=*/height,
-            /*radius=*/radius,
-            bottomPos,
-            new THREE.Vector3(0, 1, 0)
+        /*levels=*/3,
+        /*length=*/height,
+        /*radius=*/radius,
+        bottomPos,
+        new THREE.Vector3(0, 1, 0)
         );
-
-        // New: store metrics (width = diameter = 2 * radius)
-        if (!Array.isArray(treeMetrics)) treeMetrics = [];
-        treeMetrics.push({
-            id: treeMetrics.length, // simple sequential id; customize if you prefer
-            base_position: { x: bottomPos.x, y: bottomPos.y, z: bottomPos.z },
-            centroid: { x: data.centroid.x, y: data.centroid.y, z: data.centroid.z },
-            height: height,
-            width: 2 * radius
-        });
-
         scene.add(tree);
         treeMeshes.push(tree);
-        if (params.showPoints) {
-            centerCubes.push(cube);
+    };
+
+    gltfLoader.load(
+        url,
+        (gltf) => {
+        // Put model in a group for easy transforms
+        const group = new THREE.Group();
+        const model = gltf.scene || gltf.scenes?.[0];
+        if (!model) {
+            useProcedural();
+            return;
         }
+        group.add(model);
+
+        // Compute size BEFORE scaling
+        const preBox = new THREE.Box3().setFromObject(group);
+        const preSize = new THREE.Vector3();
+        preBox.getSize(preSize);
+
+        // If model has zero dims somehow, fallback
+        if (preSize.y <= 1e-6 || (preSize.x <= 1e-6 && preSize.z <= 1e-6)) {
+            useProcedural();
+            return;
+        }
+
+        // Target height and width (diameter). Fit uniformly.
+        const targetH = height;
+        const targetW = 2 * radius;
+        const srcH = preSize.y;
+        const srcW = Math.max(preSize.x, preSize.z);
+
+        // Fit to both height and width conservatively (no overgrow): pick the smaller scale
+        const sH = targetH / srcH;
+        const sW = targetW / Math.max(1e-6, srcW);
+        const s = Math.min(sH, sW);
+
+        model.scale.setScalar(s);
+
+        // Recompute bounds AFTER scaling to align base to minY
+        const postBox = new THREE.Box3().setFromObject(group);
+        const yShift = -postBox.min.y; // how much to lift so base is at y=0 in group space
+
+        group.position.set(bottomPos.x, bottomPos.y + yShift, bottomPos.z);
+
+        // Optional: orient if models are not Y-up or need random yaw
+        // group.rotation.y = Math.random() * Math.PI * 2;
+        forceBrownTransparentUnlit(group, { color: 0x8B5A2B, opacity: 0.7 });
+
+
+        scene.add(group);
+        treeMeshes.push(group);
+        },
+        undefined,
+        // onError -> fallback to procedural
+        (_err) => {
+        useProcedural();
+        }
+    );
+    };
+
+    // ----- main cluster loop -----
+    clusterData.forEach((data, clusterIndex) => { 
+    const col = new THREE.Color(rng(), rng(), rng());
+    tryAddGLBOrProcedural(data, clusterIndex, col);
     });
+
 
     if (params.showPoints) {
         // 10) draw clustered points mesh
@@ -622,8 +754,7 @@ function getVideoDims() {
     return { W, H };
 }
 
-
-function getAllTreePointsAtDistanceFromCamera(distance) {
+function getAllTreePointsAtDistanceFromCamera(minDistance, maxDistance) {
     if (!vegPointsMesh || !vegPointsMesh.geometry?.attributes?.position) return [];
 
     // Ensure camera matrices are fresh
@@ -651,9 +782,10 @@ function getAllTreePointsAtDistanceFromCamera(distance) {
         pWorld.fromBufferAttribute(posAttr, i);
 
         // signed distance ALONG the camera's forward direction:
-        // (point - camPos) ⋅ viewDir
         const along = pWorld.clone().sub(camPos).dot(viewDir);
-        if (along <= 0 || along > distance) continue; // behind camera or beyond range
+
+        // Only accept points within [minDistance, maxDistance]
+        if (along < minDistance || along > maxDistance) continue;
 
         // Project to NDC
         pNDC.copy(pWorld).project(camera);
@@ -668,39 +800,71 @@ function getAllTreePointsAtDistanceFromCamera(distance) {
         // Discard if off-screen
         if (x < 0 || y < 0 || x > W || y > H) continue;
 
-        out.push({ x, y, index: i, treeIndex: vegToCluster[pWorld.x + "," + pWorld.xy + "," + pWorld.xz] });
+        out.push({
+            x,
+            y,
+            index: i,
+            treeIndex: vegToCluster[
+                pWorld.x + "," + pWorld.y + "," + pWorld.z
+            ]
+        });
     }
 
     return out;
 }
 
+
 const images = {}
-
 async function downloadImagesAsZip(images) {
-    debugger
+  const capturedTreeIndexes = {};
+  const zip = new JSZip();
 
-    const zip = new JSZip();
+  // Group by treeIndex
+  for (const id of Object.keys(images)) {
+    for (const { img, treeIndex, pointsCount } of images[id]) {
+      (capturedTreeIndexes[treeIndex] ??= []).push({ img, pointsCount });
+    }
+  }
 
-    for (const id of Object.keys(images)) {
-        const imgArray = images[id];
-        for (let idx = 0; idx < imgArray.length; idx++) {
-            const img = imgArray[idx].img;
-            if (!img.src) continue;
+  // Build async tasks (one image per treeIndex: the max pointsCount)
+  const tasks = Object.entries(capturedTreeIndexes).map(async ([treeIndex, imageObj]) => {
+    const { img } = imageObj.reduce((max, cur) =>
+      cur.pointsCount > max.pointsCount ? cur : max, imageObj[0]
+    );
 
-            // Fetch image data as blob
-            const response = await fetch(img.src);
-            const blob = await response.blob();
+    if (!img) return;
 
-            // Add to ZIP with desired filename
-            const filename = `image_${id}_${imgArray[idx].treeIndex}_${idx}.png`;
-            zip.file(filename, blob);
-        }
+    let blob = null;
+
+    // If it's a canvas, use toBlob
+    if (img instanceof HTMLCanvasElement) {
+      blob = await new Promise(resolve => img.toBlob(resolve, "image/png"));
+    } else {
+      // Otherwise assume <img> element with a src
+      const src = img.src;
+      if (!src) return;
+
+      const res = await fetch(src, { mode: "cors" }); // CORS must be allowed for remote URLs
+      if (!res.ok) {
+        console.warn(`Failed to fetch ${src}: ${res.status} ${res.statusText}`);
+        return;
+      }
+      blob = await res.blob();
     }
 
-    // Generate ZIP and trigger download
-    const zipBlob = await zip.generateAsync({ type: "blob" });
-    saveAs(zipBlob, "segmented_images.zip");
+    if (blob) {
+      zip.file(`${treeIndex}.png`, blob);
+    }
+  });
+
+  // WAIT for all files to be added
+  await Promise.allSettled(tasks);
+
+  // Generate ZIP and trigger download
+  const zipBlob = await zip.generateAsync({ type: "blob" });
+  saveAs(zipBlob, "segmented_images.zip");
 }
+
 
 function denormBox(bn, W, H) {
     const [x, y, w, h] = bn;
@@ -858,7 +1022,7 @@ function moveCamera(delta) {
     camera.position.copy(np);
 
     // sum directions over the next N points
-    const lookAhead = 200;
+    const lookAhead = 300;
     const sumDir = new THREE.Vector3(0, 0, 0);
     for (let i = 1; i <= lookAhead &&  (camIndex + i) < cameraPoints.length; i++) {
         const idx = (camIndex + i);
@@ -878,7 +1042,7 @@ function moveCamera(delta) {
 
     seekVideoFrame(camIndex);
 
-    let points = getAllTreePointsAtDistanceFromCamera(10.0);
+    let points = getAllTreePointsAtDistanceFromCamera(7, 15.0);
     // === REMOVE OLD OVERLAY IF IT EXISTS ===
     //if (window.debugPointsMesh) {
     //  scene.remove(window.debugPointsMesh);
@@ -926,7 +1090,7 @@ function moveCamera(delta) {
         }
     }
     Object.keys(ids).forEach(id => {
-        if (ids[id].length >= 200) {
+        if (ids[id].length >= 50) {
 
             let treeIndexes = {}
             ids[id].forEach(idx => {
@@ -939,8 +1103,9 @@ function moveCamera(delta) {
             const img = makeMaskedCropForId(id, camIndex, { background: "transparent" }); // or "black"
             if (!img) return;
             if (!images[id]) images[id] = [];
-            images[id].push({img:img, treeIndex: Object.entries(treeIndexes)
-                .reduce((a, b) => (b[1].length > a[1].length ? b : a))[0]});
+            Object.entries(treeIndexes).forEach(([treeIndex, arr]) => {
+                images[id].push({img:img, treeIndex: treeIndex, pointsCount: arr.length});
+            });
         }
     });
 
@@ -993,7 +1158,7 @@ async function loadPLYWithColor(url) {
 (async () => {
     let geometry;
     try {
-        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/points_with_cameras_scaled.ply');
+        geometry = await loadPLYWithColor('/GS_Forest/Red_Pine_1/points.ply');
 
         fullPointsMesh = new THREE.Points(
             geometry,
