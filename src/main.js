@@ -18,6 +18,11 @@ const fy = 1030.2564510087936;
 const cx = 625.5;
 const cy = 351.5;
 
+// Hover picking
+const raycaster = new THREE.Raycaster();
+const mouseNDC = new THREE.Vector2();
+let hoveredTree = null; // the Group you built in createProceduralTree()
+
 const video = document.getElementById("mainVideo");
 let videoFPS = 30; // fallback
 
@@ -52,18 +57,18 @@ window.addEventListener('resize', () => {
 // — GUI & params —
 const gui = new GUI();
 const params = {
-    maxIterations: 30000,
-    clusterThreshold: 0.3,
-    minClusterSize: 120,
+    maxIterations: 40000,
+    clusterThreshold: 0.8,
+    minClusterSize: 10,
     showGround: true,
     showVegetation: true,
-    minTreeHeight: 0.6,
-    mergeClusterThreshold: 1.5,
+    minTreeHeight: 0.1,
+    mergeClusterThreshold: 0.8,
     showPoints: true,
     renderCameraPoints: true,
     showImage: false,
     showAllPoints: true,
-    radiusSigmaK: 3.0,
+    radiusSigmaK: 1.0,//2.0,
     elevationBand: 0.3048, // ± band around mean camera elevation (meters ~ 1 ft)
     showElevationBandPoints: false
 
@@ -159,6 +164,61 @@ function segmentGround() {
     //scene.add(groundMesh);
 }
 
+function gatherRaycastables(groups) {
+  const list = [];
+  groups.forEach(g => g.traverse(obj => {
+    if (obj.isMesh) list.push(obj);
+  }));
+  return list;
+}
+
+// --- Hover tooltip ---
+const tooltip = document.createElement('div');
+tooltip.style.position = 'fixed';
+tooltip.style.pointerEvents = 'none';
+tooltip.style.padding = '6px 10px';
+tooltip.style.borderRadius = '8px';
+tooltip.style.background = 'rgba(0,0,0,0.75)';
+tooltip.style.color = '#fff';
+tooltip.style.font = '12px/1.2 system-ui, sans-serif';
+tooltip.style.whiteSpace = 'pre';
+tooltip.style.zIndex = '9999';
+tooltip.style.transform = 'translate(12px, 12px)'; // small offset from cursor
+tooltip.style.opacity = '0';
+document.body.appendChild(tooltip);
+
+function showTooltip(html, clientX, clientY) {
+  tooltip.innerHTML = html;
+  tooltip.style.left = clientX + 'px';
+  tooltip.style.top  = clientY + 'px';
+  tooltip.style.opacity = '1';
+}
+function hideTooltip() {
+  tooltip.style.opacity = '0';
+}
+
+function onTreeHover(treeGroup, intersect, clientX, clientY) {
+  const stat = treeGroup?.userData?.treeStat;
+  if (!stat) return;
+
+  // Format position & height
+  const px = stat.centerX.toFixed(3);
+  const py = stat.centerY.toFixed(3);
+  const pz = stat.centerZ.toFixed(3);
+  const h  = (stat.height ?? stat.heigth ?? 0).toFixed(3); // tolerate "heigth" typo if present
+  const r  = (stat.radius ?? stat.radius ?? 0).toFixed(3); // tolerate "heigth" typo if present
+
+  const html = `
+<b>Tree</b><br/>
+pos: (${px}, ${py}, ${pz})<br/>
+height: ${h}<br/>
+radius: ${r}
+  `.trim();
+
+  showTooltip(html, clientX, clientY);
+}
+
+
 // ensure these are defined at top-level:
 let centerCubes = [];
 
@@ -166,6 +226,64 @@ function distanceAlongDirection(p1, p2, direction) {
     const u = direction.clone().normalize();
     return p2.clone().sub(p1).dot(u);
 }
+
+function findTreeRoot(obj) {
+  // climb up until the Group that represents the tree
+  while (obj && obj.parent && obj.parent !== scene && !treeMeshes.includes(obj)) {
+    obj = obj.parent;
+  }
+  // if the mesh was inside a Group that we pushed into treeMeshes, return that Group
+  if (treeMeshes.includes(obj)) return obj;
+  return null;
+}
+
+function handlePointerMove(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouseNDC.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouseNDC.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouseNDC, camera);
+
+  const hits = raycaster.intersectObjects(gatherRaycastables(treeMeshes), true);
+  if (hits.length > 0) {
+    const hit = hits[0];
+    const tree = findTreeRoot(hit.object);
+
+    if (tree) {
+      // highlight logic (optional)...
+      if (tree !== hoveredTree) {
+        if (hoveredTree) hoveredTree.traverse(o => {
+          if (o.isMesh && o.material?.emissive) o.material.emissive.setScalar(0);
+        });
+        hoveredTree = tree;
+        hoveredTree.traverse(o => {
+          if (o.isMesh && o.material?.emissive) o.material.emissive.setScalar(0.2);
+        });
+        renderer.domElement.style.cursor = 'pointer';
+      }
+
+      // always update tooltip position/content while hovering
+      onTreeHover(tree, hit, event.clientX, event.clientY);
+      return; // keep tooltip visible
+    }
+  }
+
+  // no hit: clear highlight & hide tooltip
+  if (hoveredTree) {
+    hoveredTree.traverse(o => {
+      if (o.isMesh && o.material?.emissive) o.material.emissive.setScalar(0);
+    });
+    hoveredTree = null;
+    renderer.domElement.style.cursor = 'default';
+  }
+  hideTooltip();
+}
+
+
+renderer.domElement.addEventListener('pointermove', handlePointerMove);
+renderer.domElement.addEventListener('mouseleave', hideTooltip);
+
+
 
 // — Outlier-resistant sizing via iterative sigma clipping —
 function computeRobustRadius(radialDistances) {
@@ -270,6 +388,9 @@ function createProceduralTree(levels, length, radius, pos, dir) {
     segment.applyQuaternion(quat);
     segment.position.copy(pos);
 
+    segment.raycast = THREE.Mesh.prototype.raycast; // (default; usually not needed)
+    segment.frustumCulled = false; // optional if you see misses due to culling
+
     tree.add(segment);
 
     if (levels > 0) {
@@ -305,270 +426,288 @@ function createProceduralTree(levels, length, radius, pos, dir) {
 
     return tree;
 }
+// ---------- small numeric helpers (keep once in the file) ----------
+function sqr(x){ return x*x; }
+function dist3(a,b){ return Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z); }
+
+function powerIterationSym3(cov, iters=32) {
+  // cov is 3x3 symmetric matrix in row-major array [m00,m01,m02, m10,m11,m12, m20,m21,m22]
+  // returns dominant eigenvector (unit)
+  let v = new THREE.Vector3(1,0,0).normalize();
+  for (let k=0;k<iters;k++){
+    const x = cov[0]*v.x + cov[1]*v.y + cov[2]*v.z;
+    const y = cov[3]*v.x + cov[4]*v.y + cov[5]*v.z;
+    const z = cov[6]*v.x + cov[7]*v.y + cov[8]*v.z;
+    v.set(x,y,z).normalize();
+    if (!isFinite(v.x+v.y+v.z)) break;
+  }
+  return v;
+}
+
+function covariance3(points) {
+  // points: array of {x,y,z}
+  const n = points.length;
+  if (n < 2) return [1,0,0, 0,1,0, 0,0,1];
+
+  let mx=0,my=0,mz=0;
+  for (const p of points){ mx+=p.x; my+=p.y; mz+=p.z; }
+  mx/=n; my/=n; mz/=n;
+
+  let sxx=0, sxy=0, sxz=0, syy=0, syz=0, szz=0;
+  for (const p of points){
+    const dx=p.x-mx, dy=p.y-my, dz=p.z-mz;
+    sxx += dx*dx; sxy += dx*dy; sxz += dx*dz;
+    syy += dy*dy; syz += dy*dz; szz += dz*dz;
+  }
+  // unbiased divisor n-1 to be closer to numpy.cov(rowvar=False)
+  const d = (n>1) ? (n-1) : 1;
+  sxx/=d; sxy/=d; sxz/=d; syy/=d; syz/=d; szz/=d;
+
+  // sym:
+  return [
+    sxx, sxy, sxz,
+    sxy, syy, syz,
+    sxz, syz, szz
+  ];
+}
+
+// Basic (brute-force) DBSCAN in 3D for moderate N
+function dbscan3D(points, eps, minPts) {
+  const n = points.length;
+  const labels = new Array(n).fill(-99); // -99=unvisited, -1=noise, >=0 cluster id
+  let cid = 0;
+
+  function regionQuery(i){
+    const nbrs = [];
+    const pi = points[i];
+    for (let j=0;j<n;j++){
+      if (i===j) continue;
+      if (dist3(pi, points[j]) <= eps) nbrs.push(j);
+    }
+    return nbrs;
+  }
+
+  for (let i=0;i<n;i++){
+    if (labels[i] !== -99) continue;
+    const nbrs = regionQuery(i);
+    if (nbrs.length+1 < minPts) { labels[i] = -1; continue; } // noise
+    // start new cluster
+    labels[i] = cid;
+    const seed = nbrs.slice();
+    for (let k=0;k<seed.length;k++){
+      const j = seed[k];
+      if (labels[j] === -1) labels[j] = cid;
+      if (labels[j] !== -99) continue;
+      labels[j] = cid;
+      const nbrs2 = regionQuery(j);
+      if (nbrs2.length+1 >= minPts) {
+        // expand
+        for (const m of nbrs2) if (!seed.includes(m)) seed.push(m);
+      }
+    }
+    cid++;
+  }
+  return labels;
+}
+
+function toPointArrayFromPosArray(posArray) {
+  const pts = new Array(posArray.length/3);
+  for (let i=0;i<pts.length;i++){
+    pts[i] = { x: posArray[3*i], y: posArray[3*i+1], z: posArray[3*i+2], _i: i };
+  }
+  return pts;
+}
+// -------------------------------------------------------------------
 
 function clusterTrees() {
-    if (!groundMesh) segmentGround();
+  if (!groundMesh) segmentGround();
 
-    // — clear previous visuals —
-    centerCubes.forEach(c => scene.remove(c));
-    centerCubes = [];
-    if (vegPointsMesh) scene.remove(vegPointsMesh);
+  // ------ parameters (mirroring Python; fallbacks if not in GUI) ------
+  const eps             = params.dbscanEps ?? 1.0;          // DBSCAN radius (meters)
+  const minPtsDBSCAN    = params.minPointsDBSCAN ?? 5;      // DBSCAN minPts
+  const minPtsFilter    = params.minPointsFilter ?? Math.max(20, params.minClusterSize||20);
+  const gravityMinScore = params.gravityScoreMin ?? 0.6;    // |dot(mainAxis, +Y)|
+  const minTreeHeight   = params.minTreeHeight ?? 1.0;       // meters
+  const gridSize        = params.groundGridSize ?? 0.05;     // meters
+  const deltaZ          = params.deltaZGround ?? 0.15;       // elevation-map margin above ground
 
-    // 1) extract ground‐mesh corners & compute plane normal + centroid
-    const gp = groundMesh.geometry.attributes.position.array;
-    const A = new THREE.Vector3().fromArray(gp, 0);
-    const B = new THREE.Vector3().fromArray(gp, 3);
-    const C = new THREE.Vector3().fromArray(gp, 6);
-    const D = new THREE.Vector3().fromArray(gp, 9);
+  // ------ clear prior visuals ------
+  centerCubes.forEach(c => scene.remove(c));
+  centerCubes = [];
+  if (vegPointsMesh) { scene.remove(vegPointsMesh); vegPointsMesh = null; }
+  treeMeshes.forEach(t => scene.remove(t));
+  treeMeshes = [];
+  treeStats = [];
+  if (elevationBandPointsMesh) { scene.remove(elevationBandPointsMesh); elevationBandPointsMesh = null; }
 
-    const bestNormal = new THREE.Vector3()
-        .crossVectors(B.clone().sub(A), C.clone().sub(A))
-        .normalize();
-    const centroid = A.clone().add(B).add(C).add(D).multiplyScalar(0.25);
+  // ------ build point list ------
+  const allPts = toPointArrayFromPosArray(posArray);
+  const N0 = allPts.length;
+  if (!N0) return;
 
-    // 2) build projection matrix P = I – n nᵀ for in‐plane coords
-    const I = new THREE.Matrix3().identity();
-    const nnT = new THREE.Matrix3().set(
-        bestNormal.x * bestNormal.x, bestNormal.x * bestNormal.y, bestNormal.x * bestNormal.z,
-        bestNormal.y * bestNormal.x, bestNormal.y * bestNormal.y, bestNormal.y * bestNormal.z,
-        bestNormal.z * bestNormal.x, bestNormal.z * bestNormal.y, bestNormal.z * bestNormal.z
+  // (1) Remove farthest 1/3 from origin (like Python keep_ratio=2/3)
+  allPts.forEach(p => p._d = Math.hypot(p.x, p.y, p.z));
+  allPts.sort((a,b)=>a._d-b._d);
+  const keepCount = Math.floor(allPts.length * (2/3));
+  const nearPts = allPts.slice(0, Math.max(keepCount, 1));
+
+  // (2) Elevation-map ground removal (y is up in this JS scene)
+  let minX=Infinity,minZ=Infinity,maxX=-Infinity,maxZ=-Infinity;
+  for (const p of nearPts){ if (p.x<minX)minX=p.x; if (p.z<minZ)minZ=p.z; if (p.x>maxX)maxX=p.x; if (p.z>maxZ)maxZ=p.z; }
+  const gw = Math.max(1, Math.floor((maxX-minX)/gridSize)+1);
+  const gh = Math.max(1, Math.floor((maxZ-minZ)/gridSize)+1);
+  const elev = new Float32Array(gw*gh).fill(Number.POSITIVE_INFINITY);
+
+  function gi(x,z){ 
+    const ix = Math.floor((x-minX)/gridSize);
+    const iz = Math.floor((z-minZ)/gridSize);
+    return iz*gw + ix;
+  }
+
+  // min y per cell
+  for (const p of nearPts){
+    const idx = gi(p.x,p.z);
+    if (idx<0 || idx>=elev.length) continue;
+    if (p.y < elev[idx]) elev[idx] = p.y;
+  }
+  // replace +inf (empty) by max of finite
+  let maxFinite = -Infinity;
+  for (let i=0;i<elev.length;i++){ if (isFinite(elev[i]) && elev[i]>maxFinite) maxFinite = elev[i]; }
+  for (let i=0;i<elev.length;i++){ if (!isFinite(elev[i])) elev[i] = maxFinite; }
+
+  // 3x3 median filter on grid
+  const elevFilt = new Float32Array(elev.length);
+  for (let iz=0; iz<gh; iz++){
+    for (let ix=0; ix<gw; ix++){
+      const vals = [];
+      for (let dz=-1; dz<=1; dz++){
+        for (let dx=-1; dx<=1; dx++){
+          const x2 = ix+dx, z2 = iz+dz;
+          if (x2>=0 && x2<gw && z2>=0 && z2<gh) vals.push(elev[z2*gw+x2]);
+        }
+      }
+      vals.sort((a,b)=>a-b);
+      elevFilt[iz*gw+ix] = vals[Math.floor(vals.length/2)];
+    }
+  }
+
+  // keep points whose y > ground + deltaZ
+  const noGround = [];
+  for (const p of nearPts){
+    const idx = gi(p.x,p.z);
+    if (p.y > elevFilt[idx] + deltaZ) noGround.push(p);
+  }
+  if (noGround.length === 0) return;
+
+  // (3) DBSCAN clustering in 3D
+  const labels = dbscan3D(noGround, eps, minPtsDBSCAN);
+
+  // regroup by label
+  const byLabel = new Map();
+  for (let i=0;i<labels.length;i++){
+    const lab = labels[i];
+    if (lab < 0) continue; // ignore noise
+    if (!byLabel.has(lab)) byLabel.set(lab, []);
+    byLabel.get(lab).push(noGround[i]);
+  }
+
+  // (4) PCA verticality & height filter (like Python filter_clusters)
+  const finalClusters = [];
+  for (const [lab, pts] of byLabel.entries()){
+    if (pts.length < minPtsFilter) continue;
+
+    // PCA main axis:
+    const cov = covariance3(pts);
+    const main = powerIterationSym3(cov, 40); // dominant eigenvector
+    const gravityScore = Math.abs(main.dot(new THREE.Vector3(0,1,0)));
+
+    if (gravityScore < gravityMinScore) continue;
+
+    // height (y-range)
+    let minY=Infinity, maxY=-Infinity;
+    for (const p of pts){ if (p.y<minY)minY=p.y; if (p.y>maxY)maxY=p.y; }
+    const height = maxY - minY;
+    if (height < minTreeHeight) continue;
+
+    finalClusters.push({ lab, pts, meta:{ score:gravityScore, height } });
+  }
+
+  // (5) Build visuals & stats (similar to your previous implementation)
+  const vegPos = [];
+  const vegCols = [];
+  const rng = Math.random; // (you already import seedrandom if you want determinism)
+
+  for (const cl of finalClusters){
+    // centroid
+    const cen = cl.pts.reduce((s,p)=> (s.x+=p.x, s.y+=p.y, s.z+=p.z, s), {x:0,y:0,z:0});
+    cen.x/=cl.pts.length; cen.y/=cl.pts.length; cen.z/=cl.pts.length;
+
+    // choose color
+    const col = new THREE.Color(rng(), rng(), rng());
+
+    // push colored points
+    for (const p of cl.pts){
+      vegPos.push(p.x, p.y, p.z);
+      vegCols.push(col.r, col.g, col.b);
+    }
+
+    // robust radius in XZ (fallback approach from your JS)
+    const radialDistances = cl.pts.map(p => Math.hypot(p.x - cen.x, p.z - cen.z));
+    const fittedRadius = computeRobustRadius(radialDistances);
+
+    // tree height from cluster y-range we already computed
+    const height = cl.meta.height;
+
+    // place a cube marker at centroid
+    const cube = new THREE.Mesh(
+      new THREE.BoxGeometry(0.2,0.2,0.2),
+      new THREE.MeshStandardMaterial({ color: col })
     );
-    const Pmat = new THREE.Matrix3();
-    Pmat.elements = I.elements.map((v, i) => v - nnT.elements[i]);
+    cube.position.set(cen.x, cen.y, cen.z);
+    if (params.showPoints) { scene.add(cube); centerCubes.push(cube); }
 
-    // 3) choose two in‐plane axes e1, e2
-    const e1 = (Math.abs(bestNormal.x) < 0.9
-        ? bestNormal.clone().cross(new THREE.Vector3(1, 0, 0))
-        : bestNormal.clone().cross(new THREE.Vector3(0, 1, 0))
-    ).normalize();
-    const e2 = bestNormal.clone().cross(e1).normalize();
+    // tree base at minY
+    let minY=Infinity;
+    for (const p of cl.pts) if (p.y<minY) minY=p.y;
+    const bottomPos = new THREE.Vector3(cen.x, minY, cen.z);
 
-    // 4) bin points into 2D grid cells of size = clusterThreshold
-    const bins = new Map();
-    const invT = 1 / params.clusterThreshold;
-    const tmp = new THREE.Vector3();
-    for (let i = 0; i < pointCount; i++) {
-        tmp.fromArray(posArray, i * 3).sub(centroid);
-        const inPlane = tmp.clone().applyMatrix3(Pmat);
-        const u = inPlane.dot(e1), v = inPlane.dot(e2);
-        const ku = Math.floor(u * invT), kv = Math.floor(v * invT);
-        const key = `${ku},${kv}`;
-        if (!bins.has(key)) bins.set(key, []);
-        bins.get(key).push(i);
-    }
-
-    // 5) initial clusters ≥ minClusterSize
-    let clusters = Array.from(bins.values())
-        .filter(c => c.length >= params.minClusterSize);
-
-    // 6) IQR‐based height filter along normal (rand. sampling)
-    clusters = clusters.filter(cluster => {
-        const n = cluster.length;
-        if (n < 2) return false;
-        const sampleCount = Math.min(10000, n * (n - 1) / 2);
-        const dists = [];
-        for (let k = 0; k < sampleCount; k++) {
-            let i = Math.floor(Math.random() * n);
-            let j;
-            do { j = Math.floor(Math.random() * n); } while (j === i);
-            const p1 = new THREE.Vector3().fromArray(posArray, cluster[i] * 3);
-            const p2 = new THREE.Vector3().fromArray(posArray, cluster[j] * 3);
-            dists.push(Math.abs(distanceAlongDirection(p1, p2, bestNormal)));
-        }
-        if (dists.length < 4) return false;
-        dists.sort((a, b) => a - b);
-        const q1 = dists[Math.floor(dists.length * 0.25)];
-        const q3 = dists[Math.floor(dists.length * 0.75)];
-        return (q3 - q1) > params.minTreeHeight;
-    });
-
-    // 7) compute centroids for merging step
-    clusterData = clusters.map(cluster => {
-        const cen = new THREE.Vector3();
-        cluster.forEach(idx => cen.add(new THREE.Vector3().fromArray(posArray, idx * 3)));
-        cen.divideScalar(cluster.length);
-        return { indices: cluster.slice(), centroid: cen };
-    });
-
-    // 8) merge clusters whose centroids are very close (Euclidean distance)
-    for (let i = 0; i < clusterData.length; i++) {
-        for (let j = i + 1; j < clusterData.length; j++) {
-            const d = clusterData[i].centroid.distanceTo(clusterData[j].centroid);
-            if (d < params.mergeClusterThreshold) {
-                // merge j into i
-                clusterData[i].indices.push(...clusterData[j].indices);
-                // recompute centroid of merged cluster
-                const allPts = clusterData[i].indices.map(idx =>
-                    new THREE.Vector3().fromArray(posArray, idx * 3)
-                );
-                const newCen = allPts.reduce((sum, p) => sum.add(p), new THREE.Vector3())
-                    .divideScalar(allPts.length);
-                clusterData[i].centroid.copy(newCen);
-                // remove j
-                clusterData.splice(j, 1);
-                j--;
-            }
-        }
-    }
-
-    // reset exported stats
-    treeStats = [];
-
-    // 9) visualize merged clusters
-    const vegPos = [];
-    const vegCols = [];
-
-    treeMeshes.forEach(tree => scene.remove(tree));
-
-    clusterData.forEach(data => {
-        const col = new THREE.Color(Math.random(), Math.random(), Math.random());
-        data.indices.forEach(idx => {
-            vegPos.push(...posArray.slice(idx * 3, idx * 3 + 3));
-            vegCols.push(col.r, col.g, col.b);
-        });
-        const cube = new THREE.Mesh(
-            new THREE.BoxGeometry(0.2, 0.2, 0.2),
-            new THREE.MeshStandardMaterial({ color: col })
-        );
-        cube.position.copy(data.centroid);
-        scene.add(cube);
-
-        // compute height and circle-based footprint using a slice near average camera elevation
-        let minY = Infinity, maxY = -Infinity;
-        const gp2 = groundMesh.geometry.attributes.position.array;
-        const A2 = new THREE.Vector3().fromArray(gp2, 0);
-        const B2 = new THREE.Vector3().fromArray(gp2, 3);
-        const C2 = new THREE.Vector3().fromArray(gp2, 6);
-        const groundNormal = new THREE.Vector3().crossVectors(B2.clone().sub(A2), C2.clone().sub(A2)).normalize();
-        const I3 = new THREE.Matrix3().identity();
-        const nnT2 = new THREE.Matrix3().set(
-            groundNormal.x * groundNormal.x, groundNormal.x * groundNormal.y, groundNormal.x * groundNormal.z,
-            groundNormal.y * groundNormal.x, groundNormal.y * groundNormal.y, groundNormal.y * groundNormal.z,
-            groundNormal.z * groundNormal.x, groundNormal.z * groundNormal.y, groundNormal.z * groundNormal.z
-        );
-        const Pplane = new THREE.Matrix3();
-        Pplane.elements = I3.elements.map((v, i) => v - nnT2.elements[i]);
-        const e1p = (Math.abs(groundNormal.x) < 0.9
-            ? groundNormal.clone().cross(new THREE.Vector3(1, 0, 0))
-            : groundNormal.clone().cross(new THREE.Vector3(0, 1, 0))
-        ).normalize();
-        const e2p = groundNormal.clone().cross(e1p).normalize();
-
-        // average camera elevation along groundNormal
-        let meanCamH = 0;
-        if (cameraPoints.length > 0) {
-            const camCentroid = cameraPoints.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(cameraPoints.length);
-            // elevation proxy: dot with normal relative to ground centroid (A2)
-            meanCamH = camCentroid.clone().sub(A2).dot(groundNormal);
-        }
-
-        const band = params.elevationBand;
-        const projectedSlice = [];
-        const elevationBandPositions = [];
-        const cx = data.centroid.x, cz = data.centroid.z;
-        data.indices.forEach(idx => {
-            const x = posArray[idx * 3], y = posArray[idx * 3 + 1], z = posArray[idx * 3 + 2];
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            // elevation along ground normal
-            const elev = new THREE.Vector3(x, y, z).sub(A2).dot(groundNormal);
-            if (Math.abs(elev - meanCamH) <= band) {
-                // project into plane UV
-                const v = new THREE.Vector3(x, y, z).sub(A2).applyMatrix3(Pplane);
-                const uCoord = v.dot(e1p), vCoord = v.dot(e2p);
-                projectedSlice.push([uCoord, vCoord]);
-                elevationBandPositions.push(x, y, z);
-            }
-        });
-        const height = maxY - minY;
-
-        let fittedCenter = null;
-        let fittedRadius = 0;
-        const circle = fitCircle2D(projectedSlice);
-        if (circle) {
-            fittedCenter = { u: circle.cx, v: circle.cy };
-            fittedRadius = circle.r;
-        } else {
-            // fallback to sigma-clipped radius around centroid
-            const radialDistances = [];
-            data.indices.forEach(idx => {
-                const x = posArray[idx * 3], z = posArray[idx * 3 + 2];
-                const dx = x - cx, dz = z - cz;
-                radialDistances.push(Math.sqrt(dx * dx + dz * dz));
-            });
-            fittedRadius = computeRobustRadius(radialDistances);
-        }
-
-        // 2) place tree so its base sits at the cluster bottom
-        let bottomPos;
-        if (fittedCenter) {
-            // map fitted (u,v) back to world using plane frame at A2
-            const centerWorld = A2.clone()
-                .add(e1p.clone().multiplyScalar(fittedCenter.u))
-                .add(e2p.clone().multiplyScalar(fittedCenter.v));
-            bottomPos = new THREE.Vector3(centerWorld.x, minY, centerWorld.z);
-        } else {
-            bottomPos = new THREE.Vector3(cx, minY, cz);
-        }
-        const tree = createProceduralTree(
+    const tree = createProceduralTree(
       /*levels=*/3,
       /*length=*/height,
       /*radius=*/fittedRadius,
-            bottomPos,
-            new THREE.Vector3(0, 1, 0)
-        );
+      bottomPos,
+      new THREE.Vector3(0,1,0)
+    );
+    tree.userData.treeStat = {
+      centerX: bottomPos.x,
+      centerY: bottomPos.y,
+      centerZ: bottomPos.z,
+      radius: fittedRadius,
+      diameter: 2*fittedRadius,
+      height: height,
+      points: cl.pts.length,
+      gravityScore: cl.meta.score
+    };
+    treeMeshes.push(tree);
+    scene.add(tree);
+    treeStats.push(tree.userData.treeStat);
+  }
 
-        scene.add(tree);
-        // record stats for export
-        treeStats.push({
-            centerX: bottomPos.x,
-            centerY: bottomPos.y,
-            centerZ: bottomPos.z,
-            radius: fittedRadius,
-            diameter: 2 * fittedRadius,
-            height: height,
-            points: data.indices.length,
-        });
-        treeMeshes.push(tree);
-        if(params.showPoints){
-            centerCubes.push(cube);
-        }
-    });
+  // (6) render clustered points
+  if (params.showPoints && vegPos.length){
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.Float32BufferAttribute(vegPos, 3));
+    geom.setAttribute('color', new THREE.Float32BufferAttribute(vegCols, 3));
+    vegPointsMesh = new THREE.Points(
+      geom,
+      new THREE.PointsMaterial({ size: 0.05, vertexColors: true })
+    );
+    vegPointsMesh.visible = params.showVegetation;
+    scene.add(vegPointsMesh);
+  }
 
-
-    if (params.showPoints) {
-        // 10) draw clustered points mesh
-        const geom = new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.Float32BufferAttribute(vegPos, 3));
-        geom.setAttribute('color', new THREE.Float32BufferAttribute(vegCols, 3));
-        vegPointsMesh = new THREE.Points(
-            geom,
-            new THREE.PointsMaterial({ size: 0.05, vertexColors: true })
-        );
-        vegPointsMesh.visible = params.showVegetation;
-        scene.add(vegPointsMesh);
-    }
-
-    // visualize elevation-band points if requested
-    if (elevationBandPointsMesh) { scene.remove(elevationBandPointsMesh); elevationBandPointsMesh = null; }
-    if (params.showElevationBandPoints && elevationBandPositions.length >= 3) {
-        const geomEB = new THREE.BufferGeometry();
-        geomEB.setAttribute('position', new THREE.Float32BufferAttribute(elevationBandPositions, 3));
-        elevationBandPointsMesh = new THREE.Points(
-            geomEB,
-            new THREE.PointsMaterial({
-                size: 0.12,
-                color: 0x0000ff,
-                sizeAttenuation: false,
-                depthTest: false,
-                transparent: true,
-                opacity: 1.0
-            })
-        );
-        scene.add(elevationBandPointsMesh);
-    }
-
-    showGroundPoint()
+  // refresh ground context overlay
+  showGroundPoint();
 }
 
 function laplacianSmooth(geometry, iterations = 2, lambda = 0.5) {
@@ -856,6 +995,127 @@ async function loadPLYWithColor(url) {
     return geom;
 }
 
+// ---------- Top-View Snapshot Helpers ----------
+function getGroundFrame() {
+  if (!groundMesh) segmentGround();
+  if (!groundMesh) throw new Error("No ground mesh available.");
+
+  const pos = groundMesh.geometry.attributes.position.array;
+  if (!pos || pos.length < 12) throw new Error("Ground mesh doesn't have 4 corners.");
+
+  const A = new THREE.Vector3().fromArray(pos, 0);
+  const B = new THREE.Vector3().fromArray(pos, 3);
+  const C = new THREE.Vector3().fromArray(pos, 6);
+  const D = new THREE.Vector3().fromArray(pos, 9);
+
+  const n = new THREE.Vector3().crossVectors(
+    B.clone().sub(A),
+    C.clone().sub(A)
+  ).normalize();
+
+  const centroid = A.clone().add(B).add(C).add(D).multiplyScalar(0.25);
+
+  // Build in-plane basis (e1, e2)
+  const e1 = (Math.abs(n.x) < 0.9
+    ? n.clone().cross(new THREE.Vector3(1,0,0))
+    : n.clone().cross(new THREE.Vector3(0,1,0))
+  ).normalize();
+  const e2 = n.clone().cross(e1).normalize();
+
+  // Corners in local (u,v) about centroid
+  const corners3 = [A,B,C,D];
+  const corners2 = corners3.map(P => {
+    const v = P.clone().sub(centroid);
+    return [v.dot(e1), v.dot(e2)]; // [u,v]
+  });
+
+  let minU=Infinity, maxU=-Infinity, minV=Infinity, maxV=-Infinity;
+  for (const [u,v] of corners2) {
+    if (u<minU) minU=u; if (u>maxU) maxU=u;
+    if (v<minV) minV=v; if (v>maxV) maxV=v;
+  }
+
+  return { centroid, n, e1, e2, bounds: {minU,maxU,minV,maxV}, corners3 };
+}
+
+/**
+ * Renders a top-down orthographic view to an offscreen canvas and returns a data URL.
+ * @param {object} opt
+ *   - width, height: output PNG resolution (px)
+ *   - padding: extra meters added around the ground rectangle
+ *   - flipNormal: if true, view from the opposite side of the plane normal
+ *   - transparent: if true, PNG has alpha background
+ */
+function captureTopViewDataURL(opt={}) {
+  const {
+    width = 2048,
+    height = 2048,
+    padding = 1.0,      // meters
+    flipNormal = false, // choose which side to look from
+    transparent = false
+  } = opt;
+
+  const { centroid, n, e1, e2, bounds } = getGroundFrame();
+  const lookN = flipNormal ? n.clone().negate() : n.clone();
+
+  // Ortho frustum in (u,v) plane
+  const left   = bounds.minU - padding;
+  const right  = bounds.maxU + padding;
+  const bottom = bounds.minV - padding;
+  const top    = bounds.maxV + padding;
+
+  // Build an orthographic camera whose local X->e1, Y->e2, -Z->lookN
+  const near = 0.1, far = 10000;            // generous depth range
+  const ortho = new THREE.OrthographicCamera(left, right, top, bottom, near, far);
+
+  // Place camera some distance along +lookN so everything is in front
+  const dist = 50;                           // any positive; ortho scale ignores this
+  ortho.position.copy(centroid.clone().add(lookN.clone().multiplyScalar(dist)));
+  ortho.up.copy(e2);                         // control "north" on the snapshot
+  ortho.lookAt(centroid);
+  ortho.updateProjectionMatrix();
+
+  // Offscreen renderer so we don't resize your main canvas
+  const offCanvas = document.createElement('canvas');
+  const offRenderer = new THREE.WebGLRenderer({
+    canvas: offCanvas,
+    antialias: true,
+    preserveDrawingBuffer: true
+  });
+  offRenderer.setSize(width, height, false);
+  if (transparent) {
+    offRenderer.setClearColor(0x000000, 0.0);
+  } else {
+    offRenderer.setClearColor(0xffffff, 1.0);
+  }
+
+  // Render once
+  offRenderer.render(scene, ortho);
+
+  // PNG as data URL
+  const url = offCanvas.toDataURL('image/png');
+  // Clean up WebGL context
+  offRenderer.dispose();
+  return url;
+}
+
+/**
+ * Convenience: capture and trigger a download.
+ * @param {string} filename
+ * @param {object} opt - forwarded to captureTopViewDataURL()
+ */
+function saveTopViewPNG(filename='top_view.png', opt={}) {
+  const url = captureTopViewDataURL(opt);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  return url; // also hand back the data URL if you want to embed it somewhere
+}
+
+
 // — Initialization —
 (async () => {
     let geometry;
@@ -1016,6 +1276,14 @@ async function loadPLYWithColor(url) {
     gui.add({ export: () => exportTreeStatsCSV() }, 'export').name('Export Trees CSV');
     gui.add({ prev: () => moveCamera(-1) }, 'prev').name('◀ Camera');
     gui.add({ next: () => moveCamera(+1) }, 'next').name('Camera ▶');
+
+    gui.add({ saveTop: () => saveTopViewPNG('top_view.png', {
+        width: 2048,
+        height: 2048,
+        padding: 1.0,        // meters around ground rect
+        flipNormal: false,   // set true if you need the opposite side
+        transparent: false   // set true for alpha background
+        }) }, 'saveTop').name('Save Top View PNG');
     window.addEventListener('keydown', e => {
         if (e.key === 'ArrowLeft') moveCamera(-1);
         if (e.key === 'ArrowRight') moveCamera(+1);
